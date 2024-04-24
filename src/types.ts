@@ -15,6 +15,8 @@ export type Config = {
   version?: number,
   /** Error handler */
   onError?: (reason: any) => void,
+  /** initDb timeout */
+  timeOut?: number,
 }
 
 /**

@@ -16,6 +16,7 @@ export default async function createCacheProvider<Data = any, Error = any>({
   storageHandler = simpleStorageHandler,
   version = 1,
   onError = () => {},
+  timeOut = 500,
 }: Config): Promise<CacheProvider> {
   type Cache = SWRCache<Data>
   type State = SWRState<Data, Error>
@@ -23,91 +24,105 @@ export default async function createCacheProvider<Data = any, Error = any>({
   // Initialize storage snapshot
   const map = new Map<Key, State>()
 
-  // Initialize database
-  let db: IDBPDatabase
-
-  try {
-    db = await openDB(dbName, version, {
-      upgrade (upgradeDb, oldVersion) {
-        if (!oldVersion) {
-          storageHandler.initialize(upgradeDb, storeName)
-        } else {
-          storageHandler.upgrade(upgradeDb, storeName, oldVersion)
-        }
-      }
-    })
-
-    // Get storage snapshot
-    let cursor = await db.transaction(storeName, 'readwrite').store.openCursor()
-
-    while (cursor) {
-      const key = cursor.key as Key
-      const value = storageHandler.revive(key, cursor.value)
-
-      // Stale
-      if (value === undefined) {
-        cursor.delete()
-      // OK
-      } else {
-        map.set(key, value)
-      }
-
-      cursor = await cursor.continue()
-    }
-  } catch (error) {
-    // Use fallback
-    onError(error)
-    return (): Cache => map
+  async function fallbackPromise(): Promise<CacheProvider> {
+    console.log('timeOut=>', timeOut);
+    return new Promise((resolve) => setTimeout(() => {
+      console.log('run...')
+      resolve((): Cache => map)
+    }, timeOut))
   }
 
-  /**
-   * SWR Cache provider API
-   */
-  return (globalCache: Readonly<Cache>): Cache => ({
-    keys: () =>
-      map.keys(),
+  const successPromise = async () => {
+      // Initialize database
+    let db: IDBPDatabase
 
-    get: (key: Key): State | undefined =>
-      map.get(key),
+    try {
+      db = await openDB(dbName, version, {
+        upgrade (upgradeDb, oldVersion) {
+          if (!oldVersion) {
+            storageHandler.initialize(upgradeDb, storeName)
+          } else {
+            storageHandler.upgrade(upgradeDb, storeName, oldVersion)
+          }
+        }
+      })
 
-    set: (key: Key, value: State): void => {
-      map.set(key, value)
+      // Get storage snapshot
+      let cursor = await db.transaction(storeName, 'readwrite').store.openCursor()
 
-      if (isFetchInfo(value)) {
-        return
+      while (cursor) {
+        const key = cursor.key as Key
+        const value = storageHandler.revive(key, cursor.value)
+        console.log('value=>', value);
+
+        // Stale
+        if (value === undefined) {
+          cursor.delete()
+        // OK
+        } else {
+          map.set(key, value)
+        }
+
+        cursor = await cursor.continue()
       }
-
-      const storeValue = storageHandler.replace(key, value)
-
-      if (storeValue === undefined) {
-        return
-      }
-
-      db.put(storeName, storeValue, key)
-        .catch(onError)
-    },
+    } catch (error) {
+      console.log('error=>', error);
+      // Use fallback
+      onError(error)
+      return (): Cache => map
+    }
 
     /**
-     * Used only by useSWRInfinite
+     * SWR Cache provider API
      */
-    delete: (key: Key): void => {
-      if (map.delete(key)) {
-        db.delete(storeName, key)
+    return (globalCache: Readonly<Cache>): Cache => ({
+      keys: () =>
+        map.keys(),
+
+      get: (key: Key): State | undefined =>
+        map.get(key),
+
+      set: (key: Key, value: State): void => {
+        map.set(key, value)
+
+        if (isFetchInfo(value)) {
+          return
+        }
+
+        const storeValue = storageHandler.replace(key, value)
+
+        if (storeValue === undefined) {
+          return
+        }
+
+        db.put(storeName, storeValue, key)
           .catch(onError)
-      }
-    },
+      },
 
-    /**
-     * Documented, but missing method type
-     * @link https://swr.vercel.app/docs/advanced/cache#access-to-the-cache
-     * @link https://github.com/vercel/swr/pull/1936
-     */
-    // @ts-ignore
-    clear: (): void => {
-      map.clear()
-      db.clear(storeName)
-    },
-  })
+      /**
+       * Used only by useSWRInfinite
+       */
+      delete: (key: Key): void => {
+        if (map.delete(key)) {
+          db.delete(storeName, key)
+            .catch(onError)
+        }
+      },
+
+      /**
+       * Documented, but missing method type
+       * @link https://swr.vercel.app/docs/advanced/cache#access-to-the-cache
+       * @link https://github.com/vercel/swr/pull/1936
+       */
+      // @ts-ignore
+      clear: (): void => {
+        map.clear()
+        db.clear(storeName)
+      },
+    })
+  }
+
+  return Promise.race([successPromise(), fallbackPromise()])
 
   /**
    * Do not store as non-native errors are not serializable, other properties are optional
